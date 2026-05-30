@@ -1,0 +1,114 @@
+# Measles SEIR with seasonal (school-term) forcing
+# In the spirit of He, Ionides & King (2010), J. R. Soc. Interface 7:271–283.
+#
+# Self-contained demo model for camdl-viewer: a seasonally forced SEIR with
+# births/deaths (susceptible replenishment), case importation, and an
+# observation model for weekly reported cases. Sinusoidal forcing stands in for
+# He et al.'s school-term transmission. All parameters carry sensible priors so
+# the model is ready for `--draws prior` / inference as well as forward sims.
+
+time_unit = 'days
+
+compartments { S, E, I, R }
+
+parameters {
+  R0        : positive    in [5.0, 60.0]    ~ log_normal(mu = log(30.0), sigma = 0.4)  # basic reproduction number
+  sigma     : rate        in [0.02, 0.5]    ~ log_normal(mu = log(0.125), sigma = 0.3) # 1/latent period (~8 days)
+  gamma     : rate        in [0.02, 0.5]    ~ log_normal(mu = log(0.2), sigma = 0.3)   # 1/infectious period (~5 days)
+  amplitude : probability in [0.0, 0.6]     ~ beta(alpha = 2.0, beta = 6.0)            # seasonal forcing amplitude
+  iota      : positive    in [0.01, 3.0]    ~ half_normal(sigma = 1.0)                 # importation (cases/day)
+  mu        : rate        in [1e-5, 1e-3]   ~ log_normal(mu = log(5.5e-5), sigma = 0.2)# birth = death rate (~50 yr)
+  rho       : probability in [0.3, 0.8]     ~ beta(alpha = 5.0, beta = 5.0)            # case reporting probability
+  k         : positive    in [1.0, 100.0]   ~ half_normal(sigma = 20.0)               # reporting overdispersion
+  N0        : count
+  s0        : probability in [0.02, 0.12]   ~ beta(alpha = 3.0, beta = 50.0)          # initial susceptible fraction
+  i0        : probability in [1e-5, 2e-3]   ~ beta(alpha = 2.0, beta = 2000.0)        # initial infected fraction
+}
+
+# Seasonal transmission multiplier (mean 1.0); peaks near the school year start.
+forcing {
+  seasonal : sinusoidal 'ratio {
+    amplitude = amplitude
+    period    = 365.25 'days
+    phase     = 0 'days
+    baseline  = 1.0
+  }
+}
+
+let N         = S + E + I + R
+let beta_bar  = R0 * (gamma + mu)
+
+transitions {
+  infection : S --> E  @ beta_bar * seasonal(t) * S * (I + iota) / N
+  latency   : E --> I  @ sigma * E
+  recovery  : I --> R  @ gamma * I
+
+  birth   : --> S  @ mu * N
+  death_S : S -->  @ mu * S
+  death_E : E -->  @ mu * E
+  death_I : I -->  @ mu * I
+  death_R : R -->  @ mu * R
+}
+
+init {
+  S = s0 * N0
+  E = 0
+  I = i0 * N0
+  R = N0 - s0 * N0 - i0 * N0
+}
+
+observations {
+  # Reported weekly cases — the realistic measles observable (incidence).
+  weekly_cases : {
+    projected  = incidence(recovery)
+    every      = 7 'days
+    likelihood = neg_binomial(mean = rho * projected, r = k)
+  }
+
+  # Fortnightly prevalence survey — same scale as the I compartment, so a
+  # held-out truth run's `I` observations overlay directly on the I ensemble.
+  I : {
+    projected  = prevalence(I)
+    every      = 14 'days
+    likelihood = neg_binomial(mean = projected, r = k)
+  }
+}
+
+scenarios {
+  baseline {
+    label = "Endemic measles, mild seasonality"
+    set = {
+      R0        = 30.0
+      sigma     = 0.125
+      gamma     = 0.2
+      amplitude = 0.15
+      iota      = 1.0
+      mu        = 0.000055
+      rho       = 0.5
+      k         = 20.0
+      N0        = 500_000
+      s0        = 0.06
+      i0        = 0.0002
+    }
+  }
+
+  strong_seasonality {
+    extends = baseline
+    label   = "Strong school-term forcing"
+    set     = { amplitude = 0.40 }
+  }
+
+  vaccination {
+    extends = baseline
+    label   = "Routine vaccination (lower susceptibility & R0)"
+    set     = {
+      s0 = 0.025
+      R0 = 16.0
+    }
+  }
+}
+
+simulate {
+  from = 0 'days
+  to   = 8 'years
+}

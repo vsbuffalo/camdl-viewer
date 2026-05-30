@@ -1,0 +1,15 @@
+# Baseline parameters for he_measles.camdl (matches the model's `baseline`
+# scenario). The batch runner reads these and applies per-scenario overrides
+# from batch.toml on top.
+
+R0        = 30.0       # basic reproduction number
+sigma     = 0.125      # 1/latent period  (~8 days)
+gamma     = 0.2        # 1/infectious period (~5 days)
+amplitude = 0.15       # seasonal forcing amplitude
+iota      = 1.0        # importation (cases/day)
+mu        = 0.000055   # birth = death rate (~50 yr life expectancy)
+rho       = 0.5        # case reporting probability
+k         = 20.0       # reporting overdispersion
+N0        = 500000     # population size
+s0        = 0.06       # initial susceptible fraction
+i0        = 0.0002     # initial infected fraction

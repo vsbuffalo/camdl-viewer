@@ -1,0 +1,27 @@
+# Batch sweep for the camdl-viewer demo: 30 stochastic replicates (seeds) of
+# each measles scenario, written to a content-addressable runs/ tree.
+#
+#   camdl batch run batch.toml --output-dir output
+#
+# Backend defaults to chain_binomial with dt = 1 day (Gillespie would be far
+# too slow for a measles-sized population). Base parameter values come from
+# params.toml; each scenario applies its own overrides on top.
+
+[config]
+model    = "he_measles.camdl"
+params   = "params.toml"
+seeds    = { n = 30 }
+parallel = 4
+backend  = "chain_binomial"
+dt       = 1.0
+
+[[scenario]]
+name = "baseline"
+
+[[scenario]]
+name = "strong_seasonality"
+params = { amplitude = 0.40 }
+
+[[scenario]]
+name = "vaccination"
+params = { s0 = 0.025, R0 = 16.0 }
