@@ -1,0 +1,106 @@
+# Vaccine SEIR — an endemic SEIR with a vaccination program (initial immune
+# coverage + matching birth-dose), swept over three coverage levels.
+#
+# A teaching fixture for camdl-viewer: ONE model, ONE backend, ONE base
+# parameter set, branching only at the `coverage` scenario (×3) and `seed`.
+# That keeps the CAS hierarchy clean and genuinely tree-shaped, so the viewer's
+# table-of-contents has real structure to show.
+#
+#   make            # generate results/ (3 scenarios × seeds) + held-out truth obs
+#   make view       # launch the viewer on it
+
+time_unit = 'days
+
+compartments { S, E, I, R }
+
+parameters {
+  R0       : positive    in [2.0, 30.0]   ~ log_normal(mu = log(12.0),   sigma = 0.3) # basic reproduction number
+  sigma    : rate        in [0.05, 0.5]   ~ log_normal(mu = log(0.125),  sigma = 0.3) # 1/latent period  (~8 days)
+  gamma    : rate        in [0.05, 0.5]   ~ log_normal(mu = log(0.2),    sigma = 0.3) # 1/infectious period (~5 days)
+  mu       : rate        in [1e-5, 1e-3]  ~ log_normal(mu = log(5.5e-5), sigma = 0.2) # birth = death rate (~50 yr)
+  iota     : positive    in [0.01, 5.0]   ~ half_normal(sigma = 1.0)                  # importation (infectious/day)
+  coverage : probability in [0.0, 0.95]   ~ beta(alpha = 2.0, beta = 2.0)             # vaccination coverage
+  rho      : probability in [0.3, 0.8]    ~ beta(alpha = 5.0, beta = 5.0)             # case reporting probability
+  k        : positive    in [1.0, 100.0]  ~ half_normal(sigma = 20.0)                 # reporting overdispersion
+  N0       : count
+  i0       : probability in [1e-5, 2e-3]  ~ beta(alpha = 2.0, beta = 2000.0)          # initial infectious fraction
+}
+
+let N        = S + E + I + R
+let beta_bar = R0 * (gamma + mu)
+
+transitions {
+  infection : S --> E  @ beta_bar * S * (I + iota) / N
+  latency   : E --> I  @ sigma * E
+  recovery  : I --> R  @ gamma * I
+
+  # Vaccination program: a fraction `coverage` of births are immunised at
+  # birth (enter R); the rest enter S. The matching initial immune fraction
+  # is set in `init`, so coverage shifts the whole susceptible pool.
+  birth_S : --> S  @ (1.0 - coverage) * mu * N
+  birth_R : --> R  @ coverage * mu * N
+
+  death_S : S -->  @ mu * S
+  death_E : E -->  @ mu * E
+  death_I : I -->  @ mu * I
+  death_R : R -->  @ mu * R
+}
+
+init {
+  R = coverage * N0
+  I = i0 * N0
+  E = 0
+  S = N0 - coverage * N0 - i0 * N0
+}
+
+observations {
+  # Reported weekly cases — the realistic observable (incidence of recovery).
+  weekly_cases : {
+    projected  = incidence(recovery)
+    every      = 7 'days
+    likelihood = neg_binomial(mean = rho * projected, r = k)
+  }
+
+  # Fortnightly prevalence — same scale as I, so a held-out truth run's `I`
+  # overlays directly on the I ensemble.
+  I : {
+    projected  = prevalence(I)
+    every      = 14 'days
+    likelihood = neg_binomial(mean = projected, r = k)
+  }
+}
+
+scenarios {
+  no_vaccine {
+    label = "No vaccination (coverage = 0)"
+    set = {
+      R0       = 12.0
+      sigma    = 0.125
+      gamma    = 0.2
+      mu       = 0.000055
+      iota     = 1.0
+      coverage = 0.0
+      rho      = 0.5
+      k        = 20.0
+      N0       = 200_000
+      i0       = 0.0005
+    }
+  }
+
+  vaccine_50 {
+    extends = no_vaccine
+    label   = "50% coverage"
+    set     = { coverage = 0.5 }
+  }
+
+  vaccine_80 {
+    extends = no_vaccine
+    label   = "80% coverage"
+    set     = { coverage = 0.8 }
+  }
+}
+
+simulate {
+  from = 0 'days
+  to   = 6 'years
+}

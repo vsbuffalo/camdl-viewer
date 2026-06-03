@@ -1,99 +1,128 @@
-"""camdl-viewer: tabbed Streamlit helper-viewers for camdl simulation output.
+"""camdl-viewer — browse a camdl content-addressed ``results/`` store.
 
 Launch::
 
-    uv run streamlit run app.py -- --runs /path/to/output/runs [--obs file.tsv ...]
+    uv run streamlit run app.py -- --results /path/to/results
 
-If ``--runs`` is omitted, a sidebar text input provides the path.
+Layout A: a CAS hierarchy TOC in the left rail; the main pane leads with a
+quick-view plot of the selected run, with its ``run.json`` results-browser
+below. This file is composition only — the data layer is :mod:`camdl_viewer.cas`,
+the look is :mod:`camdl_viewer.theme`, the reusable panes are
+:mod:`camdl_viewer.views`.
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
-from pathlib import Path
 
 import streamlit as st
 
-from camdl_viewer import ui_browser, ui_ensemble
-from camdl_viewer.cas import discover_runs
-from camdl_viewer.observed import discover_observed
+from camdl_viewer import cas, theme, views
 
 
 def _parse_args() -> argparse.Namespace:
-    """Parse args after the Streamlit ``--`` separator."""
-    argv = sys.argv[1:]
     parser = argparse.ArgumentParser(prog="camdl-viewer", add_help=False)
-    parser.add_argument("--runs", default=None)
-    parser.add_argument("--obs", action="append", default=[])
-    ns, _ = parser.parse_known_args(argv)
+    parser.add_argument("--results", "--runs", dest="results", default=None)
+    ns, _ = parser.parse_known_args(sys.argv[1:])
     return ns
 
 
-def _dir_token(path: str) -> float:
-    """Max mtime under ``path`` — a cache key that changes when files change."""
-    root = Path(path)
+def _dir_token(path: str) -> tuple[float, int]:
+    """(max run.json mtime, leaf count) — a cache key that moves on change."""
+    root = cas.resolve_results_root(path)
     if not root.is_dir():
-        return 0.0
-    latest = 0.0
-    for p in root.rglob("*"):
+        return (0.0, 0)
+    latest, n = 0.0, 0
+    for p in root.rglob("run.json"):
         try:
             latest = max(latest, p.stat().st_mtime)
+            n += 1
         except OSError:
             continue
-    return latest
+    return (latest, n)
 
 
-@st.cache_data(show_spinner="Scanning runs…")
-def _discover_runs(runs_root: str, token: float):
-    return discover_runs(runs_root)
+@st.cache_data(show_spinner="Scanning results…")
+def _discover_store(results_root: str, token: tuple[float, int]) -> cas.CasStore:
+    return cas.discover_store(results_root)
 
 
 @st.cache_data(show_spinner=False)
-def _discover_observed(runs_root: str, extra: tuple[str, ...], token: float):
-    return discover_observed(runs_root, list(extra))
+def _load_table(path: str):
+    return cas.load_table(path)
 
 
 def main() -> None:
-    st.set_page_config(layout="wide", page_title="camdl-viewer")
+    # "auto" = expanded on desktop, collapsed on mobile (where the sidebar is a
+    # full-screen overlay). Desktop pinning is handled in theme CSS (≥769px).
+    st.set_page_config(layout="wide", page_title="camdl-viewer", initial_sidebar_state="auto")
+    theme.setup()
     args = _parse_args()
 
-    st.sidebar.title("camdl-viewer")
-    runs_root = st.sidebar.text_input(
-        "Runs directory",
-        value=args.runs or st.session_state.get("runs_root", ""),
-        help="Path to a camdl CAS `runs/` directory.",
-        key="runs_root",
-    )
-    obs_text = st.sidebar.text_area(
-        "Observed TSVs (one path per line)",
-        value="\n".join(args.obs),
-        help="Optional extra observed-data files to overlay.",
-        key="obs_paths",
-    )
-    if st.sidebar.button("Rescan", use_container_width=True):
-        st.cache_data.clear()
+    with st.sidebar:
+        st.markdown("<div class='side-title'>camdl · viewer</div>", unsafe_allow_html=True)
+        results_root = st.text_input(
+            "Results directory",
+            value=args.results or st.session_state.get("results_root", ""),
+            placeholder="…/results",
+            key="results_root",
+            label_visibility="collapsed",
+        )
+        if st.button("rescan", width="stretch", key="rescan-btn"):
+            st.cache_data.clear()
 
-    if not runs_root:
-        st.info("Enter a camdl `runs/` directory in the sidebar to begin.")
+    if not results_root:
+        theme.note("Enter a camdl results/ directory in the sidebar to begin.")
         st.stop()
 
-    extra_obs = tuple(p.strip() for p in obs_text.splitlines() if p.strip())
-    token = _dir_token(runs_root)
+    store = _discover_store(results_root, _dir_token(results_root))
 
-    index = _discover_runs(runs_root, token)
-    observed = _discover_observed(runs_root, extra_obs, token)
+    with st.sidebar:
+        st.markdown(
+            f"<div class='side-sub'>{store.root}<br>{len(store.leaves)} leaves · "
+            f"{len(store.by_kind())} kind(s)</div>",
+            unsafe_allow_html=True,
+        )
+        for w in store.warnings:
+            theme.note(w)
+        st.markdown("<div style='height:.6rem'></div>", unsafe_allow_html=True)
+        theme.section_title("Results tree")
+        node = views.tree_nav(store)
 
-    st.sidebar.caption(
-        f"{len(index.records)} runs · {len(index.scenarios)} scenarios · "
-        f"{len(observed)} observed file(s)"
-    )
+    if node is None:
+        theme.note(store.index_note or "No runs found.")
+        return
 
-    tab_browser, tab_ensemble = st.tabs(["CAS browser", "Simulation ensemble"])
-    with tab_browser:
-        ui_browser.render(index)
-    with tab_ensemble:
-        ui_ensemble.render(index, observed)
+    # The selected node's span drives the pane: a seed → single run; a scenario
+    # node → its seed-ensemble; a branching node → cross-scenario comparison.
+    mode, payload = cas.classify_selection(node)
+    if mode == "single":
+        _single_run(payload)
+    else:
+        _aggregate(payload, node_key=node.key)
+
+
+def _single_run(leaf: cas.Leaf) -> None:
+    views.run_header(leaf)
+    with theme.card("Quick view"):
+        name = views.table_picker(leaf, key=f"qv:{leaf.run_id8}")
+        if name is None:
+            theme.note("no tabular artifact to plot for this leaf")
+        else:
+            df = _load_table(str(leaf.table_artifacts[name]))
+            views.trajectory_view(df, key=f"qv:{leaf.run_id8}:{name}")
+            with st.expander(f"{name} — raw ({df.height} × {df.width})"):
+                st.dataframe(df.to_pandas(), width="stretch")
+    with theme.card("Results browser · run.json"):
+        views.record_view(leaf, _load_table)
+
+
+def _aggregate(groups: list[cas.TreeNode], *, node_key: str) -> None:
+    views.aggregate_header(groups)
+    title = "Scenario ensemble" if len(groups) == 1 else "Scenario comparison"
+    with theme.card(title):
+        views.comparison_view(groups, key=f"cmp:{node_key}", load_table=_load_table)
 
 
 if __name__ == "__main__":

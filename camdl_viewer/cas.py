@@ -1,264 +1,653 @@
-"""Discover and load runs from a camdl content-addressable storage (CAS) tree.
+"""Read a camdl content-addressed (CAS) ``results/`` store.
 
-Canonical layout::
+This mirrors the Rust reader (`runid::RunRecord` + `cli/src/cas_read.rs`) and
+follows the consumer contract in ``camdl/docs/dev/cas-path-shape-contract.md``:
 
-    runs/{sim_hash8}/{scenario_slug}-{scen_hash8}/seed_{n}/{traj.tsv, run.json}
+    The one rule — resolve runs by reading ``run.json``, never by parsing path
+    segments.
 
-`run.json` comes in two on-disk shapes which are both handled here:
+Layout::
 
-* *old flat* — sim fields (`scenario`, `seed`, `sim_hash`, ...) at top level,
-  no `kind`/`status`/`hash`.
-* *new tagged* — top-level `hash, version, created_at, argv, status, label,
-  kind`, with the sim fields nested inside `kind` (a dict whose own `kind`
-  string is the discriminator), mirroring the Rust `Run`/`RunKind` structs in
-  `camdl/rust/crates/cli/src/run_meta.rs`.
+    results/<kind_dir>/<seg>/<seg>/…/run.json
+
+Every leaf directory holds a ``run.json`` (a ``runid::RunRecord``). Discovery
+is purely structural: a directory with a *parseable* ``run.json`` is a leaf, at
+any depth. We never infer kind / parameters / seed / lineage from the path —
+those come from the record's ``kind`` / ``levels`` / ``deps`` / ``children``.
+
+The pre-gh#147 layout (``runs/{sim8}/{scenario}-{scen8}/seed_n/`` with a nested
+``kind`` dict) is *not* readable here — those records are rejected with a
+warning. There is no migration: clear ``results/`` and re-run.
 """
 
 from __future__ import annotations
 
 import json
-import re
-from dataclasses import dataclass
+from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import polars as pl
 
-# Deterministic qualitative palette (Plotly "D3"), indexed by sorted scenario
-# name so a scenario keeps its colour regardless of which checkboxes are on.
-_PALETTE = [
-    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
-    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+# The kind discriminator (`runid::ArtifactKind`, snake_case wire form) → the
+# top-level store partition directory. Mirrors `ArtifactKind` declaration
+# order; `obs`/`projection` are reserved (no leaf emitted yet).
+KIND_DIR = {
+    "sim": "sims",
+    "fit_stage": "fits",
+    "pfilter": "pfilters",
+    "survey": "surveys",
+    "profile_point": "profiles",
+    "sim_ensemble": "ensembles",
+    "obs": "obs",
+    "projection": "projections",
+}
+
+# Kind display order for the browser (declaration order, reserved kinds last).
+KIND_ORDER = [
+    "sim",
+    "sim_ensemble",
+    "fit_stage",
+    "pfilter",
+    "survey",
+    "profile_point",
+    "obs",
+    "projection",
 ]
 
-_SEED_RE = re.compile(r"seed_(\d+)$")
+
+# --------------------------------------------------------------------------- #
+# Record types — a 1:1 mirror of `runid::RunRecord` and friends (record.rs).
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class LevelId:
+    """One factored identity level, in path order (`runid::LevelId`)."""
+
+    name: str
+    label: str
+    hash: str
+    schema_version: int
+
+    @property
+    def hash8(self) -> str:
+        return self.hash[:8]
+
+
+@dataclass(frozen=True)
+class ArtifactRef:
+    """A lineage edge: an upstream artifact this run consumed (`deps`)."""
+
+    run_id: str
+    kind: str
+    artifact: str
+    digest: str
+
+    @property
+    def run_id8(self) -> str:
+        return self.run_id[:8]
+
+
+@dataclass(frozen=True)
+class FileChecksum:
+    """Checksum of one of the leaf's own files (an `artifacts` entry)."""
+
+    bytes: int
+    mtime: str
+    digest: str
+
+    @property
+    def digest8(self) -> str:
+        return self.digest[:8]
+
+
+@dataclass(frozen=True)
+class Provenance:
+    """Recorded-not-hashed provenance (`runid::Provenance`)."""
+
+    argv: tuple[str, ...] = ()
+    label: str | None = None
+    created_at: str | None = None
+    finished_at: str | None = None
+    host: str | None = None
+    camdl_version: str | None = None
+    thread_count: int | None = None
+    source_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class RunRecord:
-    scenario: str
-    seed: int | None
-    sim_hash: str
-    scen_hash: str
-    kind: str
-    run_dir: Path
-    traj_path: Path | None
-    run_json: dict[str, Any] | None
-    parse_errors: tuple[str, ...] = ()
+    """The leaf's ``run.json`` (`runid::RunRecord`).
 
-
-@dataclass
-class ScenarioGroup:
-    scenario: str
-    scen_hash: str
-    color: str
-    records: list[RunRecord]  # one per seed, sorted by seed
-
-
-@dataclass
-class CasIndex:
-    runs_root: Path
-    records: list[RunRecord]
-    scenarios: list[ScenarioGroup]  # simulate-kind only, grouped + coloured
-    warnings: list[str]
-
-
-def normalize_run_json(raw: dict[str, Any]) -> dict[str, Any]:
-    """Flatten old-flat and new-tagged ``run.json`` into a common dict.
-
-    Returns a dict with keys: ``model, model_hash, scenario, sim_hash,
-    scen_hash, seed, backend, dt, version, created_at, argv, kind, status,
-    label, hash``. Missing keys default to ``None``. Pure; no I/O.
+    ``raw`` keeps the untouched parsed JSON so the UI can always show the
+    authoritative dict, even for fields this reader doesn't model yet.
     """
-    out: dict[str, Any] = {
-        k: None
-        for k in (
-            "model", "model_hash", "scenario", "sim_hash", "scen_hash",
-            "seed", "backend", "dt", "version", "created_at", "argv",
-            "kind", "status", "label", "hash",
+
+    format_version: int
+    kind: str
+    run_id: str
+    hash_version: int
+    ir_version: str
+    engine_version: str
+    levels: tuple[LevelId, ...]
+    deps: tuple[ArtifactRef, ...]
+    status: str
+    artifacts: dict[str, FileChecksum]
+    children: dict[str, tuple[str, ...]]
+    inputs: Any
+    provenance: Provenance
+    raw: dict[str, Any]
+
+
+# --------------------------------------------------------------------------- #
+# Leaf — a record plus its on-disk directory, with display accessors.
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class Leaf:
+    dir: Path
+    record: RunRecord
+
+    @property
+    def run_id(self) -> str:
+        return self.record.run_id
+
+    @property
+    def run_id8(self) -> str:
+        return self.record.run_id[:8]
+
+    @property
+    def kind(self) -> str:
+        return self.record.kind
+
+    @property
+    def status(self) -> str:
+        return self.record.status
+
+    def level_label(self, name: str) -> str | None:
+        """The readable label of the level named ``name`` (provenance only)."""
+        for lvl in self.record.levels:
+            if lvl.name == name:
+                return lvl.label
+        return None
+
+    @property
+    def display_label(self) -> str:
+        """The most specific level label (the last segment), e.g. ``seed_42``."""
+        return self.record.levels[-1].label if self.record.levels else self.run_id8
+
+    @property
+    def seed(self) -> int | None:
+        """Base seed parsed from a ``seed_{n}`` level label, if present."""
+        label = self.level_label("seed")
+        if label and label.startswith("seed_"):
+            tail = label.removeprefix("seed_")
+            return int(tail) if tail.isdigit() else None
+        return None
+
+    @property
+    def artifact_paths(self) -> dict[str, Path]:
+        """Declared artifacts that actually exist on disk: name → path."""
+        out: dict[str, Path] = {}
+        for name in self.record.artifacts:
+            p = self.dir / name
+            if p.is_file():
+                out[name] = p
+        return out
+
+    @property
+    def table_artifacts(self) -> dict[str, Path]:
+        """Existing ``.tsv`` artifacts, ``traj.tsv`` first if present."""
+        existing = self.artifact_paths
+        tsvs = {n: p for n, p in existing.items() if n.endswith(".tsv")}
+        if "traj.tsv" in tsvs:  # surface the canonical trajectory first
+            return {"traj.tsv": tsvs.pop("traj.tsv"), **tsvs}
+        return tsvs
+
+
+@dataclass(frozen=True)
+class ObsChild:
+    """A best-effort view of an ``obs/`` sub-artifact (not a ``RunRecord``).
+
+    Layout: ``<leaf>/obs/<obs_hash8>-<obs_seed>/{obs.json, <stream>.tsv}``.
+    Reached through the parent leaf's ``children["obs"]`` per the contract; we
+    enumerate the dir on disk since the child run_ids are not addressable yet.
+    """
+
+    dir: Path
+    obs_json: dict[str, Any]
+    stream_paths: dict[str, Path]  # stream name → <stream>.tsv path
+
+
+@dataclass
+class CasStore:
+    root: Path
+    leaves: list[Leaf]
+    warnings: list[str] = field(default_factory=list)
+    index_note: str = ""
+
+    def by_kind(self) -> dict[str, list[Leaf]]:
+        """Leaves grouped by kind, in :data:`KIND_ORDER`, sorted within a kind."""
+        groups: dict[str, list[Leaf]] = defaultdict(list)
+        for leaf in self.leaves:
+            groups[leaf.kind].append(leaf)
+        ordered: dict[str, list[Leaf]] = {}
+        for kind in KIND_ORDER:
+            if kind in groups:
+                ordered[kind] = sorted(groups.pop(kind), key=_leaf_sort_key)
+        for kind in sorted(groups):  # any unknown kinds, after the known ones
+            ordered[kind] = sorted(groups[kind], key=_leaf_sort_key)
+        return ordered
+
+    def find(self, run_id_or_prefix: str) -> Leaf | None:
+        """Resolve a leaf by full ``run_id`` or unique hex prefix."""
+        hits = [l for l in self.leaves if l.run_id.startswith(run_id_or_prefix)]
+        return hits[0] if len(hits) == 1 else None
+
+
+def _leaf_sort_key(leaf: Leaf) -> tuple[Any, ...]:
+    """Stable display order: by level labels, then seed, then run_id."""
+    labels = tuple(lvl.label for lvl in leaf.record.levels[:-1])
+    seed = leaf.seed
+    return (labels, seed is None, seed or 0, leaf.run_id)
+
+
+# --------------------------------------------------------------------------- #
+# Tree — the factored levels form a prefix tree (kind → level hashes). Pure;
+# the sidebar TOC view renders this without re-deriving structure.
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class TreeNode:
+    """One node of the CAS navigation tree.
+
+    Interior nodes group leaves that share a level *hash* (identity); ``leaf``
+    is set only on terminal nodes (a node at the last level *is* the run).
+    ``label`` is the readable level label, disambiguated with a ``·hash8``
+    suffix when sibling labels collide (labels are provenance and may repeat).
+    """
+
+    key: str
+    label: str
+    count: int
+    children: list[TreeNode] = field(default_factory=list)
+    leaf: Leaf | None = None
+
+    @property
+    def is_leaf(self) -> bool:
+        return self.leaf is not None
+
+    def leaves(self) -> list[Leaf]:
+        """Every leaf at or below this node, in display order."""
+        if self.leaf is not None:
+            return [self.leaf]
+        out: list[Leaf] = []
+        for child in self.children:
+            out.extend(child.leaves())
+        return out
+
+
+def build_tree(store: CasStore) -> list[TreeNode]:
+    """Group the store's leaves into a kind → levels prefix tree (pure).
+
+    Single-child interior chains are path-compressed: a run of levels that
+    never branches (e.g. one model → one config → one params) collapses into a
+    single ``a / b / c`` row, so the tree shows depth only where it actually
+    forks (here: the scenario).
+    """
+    roots: list[TreeNode] = []
+    for kind, leaves in store.by_kind().items():
+        root = TreeNode(key=f"k::{kind}", label=kind, count=len(leaves))
+        root.children = [_compress(c) for c in _level_children(leaves, 0, root.key)]
+        roots.append(root)
+    return roots
+
+
+def _compress(node: TreeNode) -> TreeNode:
+    """Absorb single interior children into one ``a / b / c`` node (in place)."""
+    node.children = [_compress(c) for c in node.children]
+    while len(node.children) == 1 and not node.children[0].is_leaf:
+        child = node.children[0]
+        node.label = f"{node.label} / {child.label}"
+        node.key = child.key  # keep the deepest key stable for open-state
+        node.children = child.children
+    return node
+
+
+def find_node(roots: list[TreeNode], key: str) -> TreeNode | None:
+    """Locate a node by its stable ``key`` (DFS over the built tree)."""
+    stack = list(roots)
+    while stack:
+        n = stack.pop()
+        if n.key == key:
+            return n
+        stack.extend(n.children)
+    return None
+
+
+def first_leaf_node(roots: list[TreeNode]) -> TreeNode | None:
+    """The first *leaf* node in display order (the default selection)."""
+    for n in roots:
+        if n.is_leaf:
+            return n
+        found = first_leaf_node(n.children)
+        if found is not None:
+            return found
+    return None
+
+
+# What a selected tree node spans — the page renders one of these.
+Selection = tuple[str, Any]  # ("single", Leaf) | ("group", list[TreeNode])
+
+
+def classify_selection(node: TreeNode) -> Selection:
+    """Decide what the selected node means for the main pane.
+
+    - a leaf            → ``("single", Leaf)`` — one run.
+    - a scenario node   → ``("group", [node])`` — aggregate its seed replicates.
+    - a branching node  → ``("group", node.children)`` — compare each child
+      group (e.g. each scenario), descending through any single-child chain
+      first so selecting a kind/root lands on the real branch point.
+    """
+    if node.is_leaf:
+        return ("single", node.leaf)
+    cur = node
+    while len(cur.children) == 1 and not cur.children[0].is_leaf:
+        cur = cur.children[0]
+    if cur.children and all(c.is_leaf for c in cur.children):
+        return ("group", [cur])
+    return ("group", list(cur.children))
+
+
+def _level_children(leaves: list[Leaf], depth: int, prefix: str) -> list[TreeNode]:
+    """Recursively bucket ``leaves`` by their ``levels[depth]`` hash (identity)."""
+    buckets: dict[str, list[Leaf]] = {}
+    for lf in leaves:
+        if depth < len(lf.record.levels):
+            buckets.setdefault(lf.record.levels[depth].hash, []).append(lf)
+
+    ordered = sorted(
+        buckets.items(),
+        key=lambda kv: (kv[1][0].record.levels[depth].label, kv[0]),
+    )
+    labels = [grp[0].record.levels[depth].label for _, grp in ordered]
+    dup = {lab for lab in labels if labels.count(lab) > 1}
+
+    nodes: list[TreeNode] = []
+    for h, grp in ordered:
+        lvl = grp[0].record.levels[depth]
+        disp = lvl.label + (f" ·{h[:8]}" if lvl.label in dup else "")
+        key = f"{prefix}/{h[:8]}"
+        is_last = depth + 1 >= len(grp[0].record.levels)
+        if is_last:
+            nodes.append(TreeNode(key=key, label=disp, count=len(grp), leaf=grp[0]))
+        else:
+            nodes.append(
+                TreeNode(
+                    key=key,
+                    label=disp,
+                    count=len(grp),
+                    children=_level_children(grp, depth + 1, key),
+                )
+            )
+    return nodes
+
+
+# --------------------------------------------------------------------------- #
+# Parsing — strict to the new schema, defensive about partial/in-flight runs.
+# --------------------------------------------------------------------------- #
+
+
+def parse_run_record(raw: dict[str, Any]) -> RunRecord:
+    """Parse a new-format ``run.json`` dict into a :class:`RunRecord`.
+
+    Raises ``ValueError`` if ``raw`` is not a new-format record — notably the
+    pre-gh#147 layout, where ``kind`` is a nested dict rather than a string.
+    Missing optional fields default (an in-flight ``running`` leaf may have no
+    ``artifacts``/``deps`` yet); ``run_id``, ``kind`` and ``levels`` are
+    required.
+    """
+    kind = raw.get("kind")
+    if isinstance(kind, dict):
+        raise ValueError(
+            "pre-gh#147 run.json (nested `kind`); this store predates the "
+            "content-addressed refactor — clear results/ and re-run camdl"
         )
-    }
+    if not isinstance(kind, str):
+        raise ValueError("run.json has no string `kind`")
+    run_id = raw.get("run_id")
+    if not isinstance(run_id, str) or not run_id:
+        raise ValueError("run.json has no `run_id`")
+    levels_raw = raw.get("levels")
+    if not isinstance(levels_raw, list):
+        raise ValueError("run.json has no `levels` array")
 
-    kind_field = raw.get("kind")
-    if isinstance(kind_field, dict):
-        # New tagged format: lift the nested kind payload to the top level.
-        out["kind"] = kind_field.get("kind", "unknown")
-        for key, value in kind_field.items():
-            if key == "kind":
-                continue
-            out[key] = value
-        for key in ("hash", "version", "created_at", "argv", "status", "label"):
-            if key in raw:
-                out[key] = raw[key]
-    else:
-        # Old flat format (or already-flat). kind defaults to "simulate".
-        for key in out:
-            if key in raw:
-                out[key] = raw[key]
-        out["kind"] = raw.get("kind") or "simulate"
+    levels = tuple(
+        LevelId(
+            name=str(l.get("name", "")),
+            label=str(l.get("label", "")),
+            hash=str(l.get("hash", "")),
+            schema_version=int(l.get("schema_version", 0)),
+        )
+        for l in levels_raw
+        if isinstance(l, dict)
+    )
 
-    return out
+    deps = tuple(
+        ArtifactRef(
+            run_id=str(d.get("run_id", "")),
+            kind=str(d.get("kind", "")),
+            artifact=str(d.get("artifact", "")),
+            digest=str(d.get("digest", "")),
+        )
+        for d in raw.get("deps", []) or []
+        if isinstance(d, dict)
+    )
 
+    artifacts: dict[str, FileChecksum] = {}
+    for name, fc in (raw.get("artifacts", {}) or {}).items():
+        if isinstance(fc, dict):
+            artifacts[str(name)] = FileChecksum(
+                bytes=int(fc.get("bytes", 0)),
+                mtime=str(fc.get("mtime", "")),
+                digest=str(fc.get("digest", "")),
+            )
 
-def load_run_json(run_dir: Path) -> tuple[dict[str, Any] | None, list[str]]:
-    """Read and normalize ``run.json`` in ``run_dir``."""
-    path = run_dir / "run.json"
-    if not path.is_file():
-        return None, [f"no run.json in {run_dir}"]
-    try:
-        raw = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        return None, [f"unreadable run.json in {run_dir}: {exc}"]
-    if not isinstance(raw, dict):
-        return None, [f"run.json in {run_dir} is not an object"]
-    return normalize_run_json(raw), []
+    children: dict[str, tuple[str, ...]] = {}
+    for ns, ids in (raw.get("children", {}) or {}).items():
+        if isinstance(ids, list):
+            children[str(ns)] = tuple(str(i) for i in ids)
 
-
-def _split_scenario_dir(name: str) -> tuple[str, str]:
-    """Split a ``{slug}-{scen_hash8}`` dir name into (scenario, scen_hash)."""
-    if "-" in name:
-        slug, _, tail = name.rpartition("-")
-        # Treat the tail as a hash only if it looks like one (hex-ish, short).
-        if slug and re.fullmatch(r"[0-9a-fA-F]{4,}", tail):
-            return slug, tail
-    return name, ""
-
-
-def _seed_from_dir(name: str) -> int | None:
-    m = _SEED_RE.search(name)
-    return int(m.group(1)) if m else None
-
-
-def _record_from_leaf(leaf: Path, warnings: list[str]) -> RunRecord:
-    """Build a RunRecord from a seed-level directory, preferring run.json."""
-    run_json, errors = load_run_json(leaf)
-    warnings.extend(errors)
-
-    traj = leaf / "traj.tsv"
-    traj_path = traj if traj.is_file() else None
-    if traj_path is None:
-        warnings.append(f"no traj.tsv in {leaf}")
-
-    # Path-derived fallbacks.
-    scen_dir = leaf.parent.name
-    path_scenario, path_scen_hash = _split_scenario_dir(scen_dir)
-    path_seed = _seed_from_dir(leaf.name)
-    path_sim_hash = leaf.parent.parent.name
-
-    if run_json is not None:
-        scenario = run_json.get("scenario") or path_scenario
-        seed = run_json.get("seed")
-        seed = int(seed) if seed is not None else path_seed
-        sim_hash = run_json.get("sim_hash") or path_sim_hash
-        scen_hash = run_json.get("scen_hash") or path_scen_hash
-        kind = run_json.get("kind") or "simulate"
-    else:
-        scenario, seed = path_scenario, path_seed
-        sim_hash, scen_hash, kind = path_sim_hash, path_scen_hash, "simulate"
+    prov_raw = raw.get("provenance", {}) or {}
+    provenance = Provenance(
+        argv=tuple(str(a) for a in prov_raw.get("argv", []) or []),
+        label=prov_raw.get("label"),
+        created_at=prov_raw.get("created_at"),
+        finished_at=prov_raw.get("finished_at"),
+        host=prov_raw.get("host"),
+        camdl_version=prov_raw.get("camdl_version"),
+        thread_count=prov_raw.get("thread_count"),
+        source_paths=tuple(str(s) for s in prov_raw.get("source_paths", []) or []),
+    )
 
     return RunRecord(
-        scenario=scenario,
-        seed=seed,
-        sim_hash=sim_hash or "",
-        scen_hash=scen_hash or "",
+        format_version=int(raw.get("format_version", 0)),
         kind=kind,
-        run_dir=leaf,
-        traj_path=traj_path,
-        run_json=run_json,
-        parse_errors=tuple(errors),
+        run_id=run_id,
+        hash_version=int(raw.get("hash_version", 0)),
+        ir_version=str(raw.get("ir_version", "")),
+        engine_version=str(raw.get("engine_version", "")),
+        levels=levels,
+        deps=deps,
+        status=str(raw.get("status", "")),
+        artifacts=artifacts,
+        children=children,
+        inputs=raw.get("inputs"),
+        provenance=provenance,
+        raw=raw,
     )
 
 
-def _group_scenarios(records: list[RunRecord]) -> list[ScenarioGroup]:
-    """Group simulate-kind records by (scenario, scen_hash), assign colours."""
-    sims = [r for r in records if r.kind == "simulate"]
-    keys = sorted({(r.scenario, r.scen_hash) for r in sims})
-    # Colour by sorted scenario name so colours are stable across runs.
-    scen_names = sorted({k[0] for k in keys})
-    color_of = {
-        name: _PALETTE[i % len(_PALETTE)] for i, name in enumerate(scen_names)
-    }
-    groups: list[ScenarioGroup] = []
-    for scenario, scen_hash in keys:
-        recs = sorted(
-            (r for r in sims if (r.scenario, r.scen_hash) == (scenario, scen_hash)),
-            key=lambda r: (r.seed is None, r.seed if r.seed is not None else 0),
-        )
-        groups.append(
-            ScenarioGroup(
-                scenario=scenario,
-                scen_hash=scen_hash,
-                color=color_of[scenario],
-                records=recs,
-            )
-        )
-    return groups
+def load_run_record(run_dir: Path) -> tuple[RunRecord | None, str | None]:
+    """Read + parse ``run.json`` in ``run_dir``. Returns ``(record, warning)``."""
+    path = run_dir / "run.json"
+    if not path.is_file():
+        return None, None  # not a leaf; silent (most dirs are not leaves)
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, f"unreadable run.json in {run_dir}: {exc}"
+    if not isinstance(raw, dict):
+        return None, f"run.json in {run_dir} is not an object"
+    try:
+        return parse_run_record(raw), None
+    except ValueError as exc:
+        return None, f"{run_dir}: {exc}"
 
 
-def discover_runs(runs_root: str | Path) -> CasIndex:
-    """Walk ``runs_root`` and build a structured index of runs.
+# --------------------------------------------------------------------------- #
+# Discovery — the structural walk (mirrors cas_read::walk_records).
+# --------------------------------------------------------------------------- #
 
-    Canonical pass walks ``{sim8}/{slug}-{scen8}/seed_{n}/``. If that yields
-    nothing, a fallback pass globs ``**/traj.tsv`` and infers fields from the
-    path. Simulate-kind records are grouped into coloured ScenarioGroups.
+
+def walk_records(subtree: Path) -> tuple[list[Leaf], list[str]]:
+    """Collect every leaf under ``subtree``: a dir with a parseable ``run.json``.
+
+    Mirrors the Rust ``walk_records`` exactly: depth-first, hidden dirs
+    (``.staging``/``.quarantine``) skipped, the presence of a parseable record
+    the only discovery signal. Descends through leaves too (a leaf's ``obs/``
+    children carry ``obs.json``, not ``run.json``, so they aren't surfaced as
+    standalone leaves).
     """
-    root = Path(runs_root)
+    leaves: list[Leaf] = []
     warnings: list[str] = []
-    records: list[RunRecord] = []
+    if not subtree.exists():
+        return leaves, warnings
+    stack = [subtree]
+    while stack:
+        d = stack.pop()
+        record, warning = load_run_record(d)
+        if warning:
+            warnings.append(warning)
+        if record is not None:
+            leaves.append(Leaf(dir=d, record=record))
+        try:
+            children = list(d.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            if child.is_dir() and not child.name.startswith("."):
+                stack.append(child)
+    return leaves, warnings
 
+
+def resolve_results_root(path: str | Path) -> Path:
+    """Resolve the store root the user pointed us at.
+
+    Accepts the store root directly, or a parent containing a ``results/``
+    dir (so ``--results ../camdl`` and ``--results ../camdl/results`` both
+    work). Does not require the dir to exist (caller reports that).
+    """
+    p = Path(path).expanduser()
+    if p.name != "results" and (p / "results").is_dir():
+        return p / "results"
+    return p
+
+
+def discover_store(path: str | Path) -> CasStore:
+    """Walk a CAS ``results/`` store and return its leaves + diagnostics."""
+    root = resolve_results_root(path)
     if not root.is_dir():
-        warnings.append(f"runs directory does not exist: {root}")
-        return CasIndex(root, [], [], warnings)
+        return CasStore(root, [], [f"store directory does not exist: {root}"])
 
-    seen: set[Path] = set()
-    # Canonical pass: sim_hash / scenario-scenhash / seed_n
-    for sim_dir in sorted(p for p in root.iterdir() if p.is_dir()):
-        for scen_dir in sorted(p for p in sim_dir.iterdir() if p.is_dir()):
-            for seed_dir in sorted(p for p in scen_dir.iterdir() if p.is_dir()):
-                if not _SEED_RE.search(seed_dir.name):
-                    continue
-                if (seed_dir / "traj.tsv").is_file() or (seed_dir / "run.json").is_file():
-                    records.append(_record_from_leaf(seed_dir, warnings))
-                    seen.add(seed_dir)
+    leaves, warnings = walk_records(root)
+    if not leaves and not warnings:
+        warnings.append(f"no runs (no parseable run.json) found under {root}")
 
-    # Fallback pass: any traj.tsv we missed (non-canonical depth/layout).
-    if not records:
-        for traj in sorted(root.glob("**/traj.tsv")):
-            leaf = traj.parent
-            if leaf in seen:
-                continue
-            records.append(_record_from_leaf(leaf, warnings))
-            seen.add(leaf)
-        if records:
-            warnings.append(
-                "runs not in canonical layout; inferred from traj.tsv paths"
-            )
-
-    if not records:
-        warnings.append(f"no runs found under {root}")
-
-    scenarios = _group_scenarios(records)
-    return CasIndex(root, records, scenarios, warnings)
+    index_note = _index_note(root, len(leaves))
+    return CasStore(root, leaves, warnings, index_note)
 
 
-def load_traj(traj_path: str | Path) -> pl.DataFrame:
-    """Read a ``traj.tsv``, skipping the leading ``# camdl ...`` comment line.
+def _index_note(root: Path, n_leaves: int) -> str:
+    """A human note on ``index.json`` (a cache; we always walk regardless)."""
+    idx = root / "index.json"
+    if not idx.is_file():
+        return f"no index.json (walked {n_leaves} leaves directly)"
+    try:
+        data = json.loads(idx.read_text())
+        n = len(data.get("entries", []))
+        return f"index.json: {n} entries (cache only; walked {n_leaves} live leaves)"
+    except (OSError, json.JSONDecodeError):
+        return f"index.json present but unreadable (walked {n_leaves} leaves)"
 
-    The first column is ``t`` (cast to Float64); the rest are numeric streams.
+
+def discover_obs_children(leaf: Leaf) -> list[ObsChild]:
+    """Best-effort enumeration of a leaf's ``obs/`` sub-artifacts.
+
+    Per the contract these are reached through ``children["obs"]``, but the
+    child run_ids aren't addressable as leaves yet, so we enumerate
+    ``<leaf>/obs/*/`` on disk and read each ``obs.json``.
+    """
+    obs_root = leaf.dir / "obs"
+    if not obs_root.is_dir():
+        return []
+    children: list[ObsChild] = []
+    for d in sorted(obs_root.iterdir()):
+        if not d.is_dir():
+            continue
+        oj = d / "obs.json"
+        obs_json: dict[str, Any] = {}
+        if oj.is_file():
+            try:
+                loaded = json.loads(oj.read_text())
+                if isinstance(loaded, dict):
+                    obs_json = loaded
+            except (OSError, json.JSONDecodeError):
+                pass
+        streams = {
+            p.stem: p for p in sorted(d.glob("*.tsv"))
+        }
+        children.append(ObsChild(dir=d, obs_json=obs_json, stream_paths=streams))
+    return children
+
+
+# --------------------------------------------------------------------------- #
+# Table loading — camdl TSVs (traj.tsv / ensemble.tsv / obs streams).
+# --------------------------------------------------------------------------- #
+
+_TIME_COLS = ("t", "time")
+
+
+def load_table(path: str | Path) -> pl.DataFrame:
+    """Read a camdl TSV, skipping any leading ``# camdl …`` comment line.
+
+    Generic over trajectory, ensemble, and observed-stream files. The first
+    column is cast to ``Float64`` when it is a time axis (``t``/``time``); the
+    rest are left as inferred numeric streams.
     """
     df = pl.read_csv(
-        Path(traj_path),
+        Path(path),
         separator="\t",
         comment_prefix="#",
         infer_schema_length=10_000,
     )
-    if df.columns and df.columns[0] != "t":
-        df = df.rename({df.columns[0]: "t"})
-    if "t" in df.columns:
-        df = df.with_columns(pl.col("t").cast(pl.Float64, strict=False))
+    if df.columns and df.columns[0] in _TIME_COLS:
+        df = df.with_columns(pl.col(df.columns[0]).cast(pl.Float64, strict=False))
     return df
 
 
-def traj_stream_columns(df: pl.DataFrame) -> list[str]:
-    """All columns except the time column ``t``, in file order."""
-    return [c for c in df.columns if c != "t"]
+def time_column(df: pl.DataFrame) -> str | None:
+    """The time axis column (``t``/``time``) if the first column is one."""
+    if df.columns and df.columns[0] in _TIME_COLS:
+        return df.columns[0]
+    return None
+
+
+def value_columns(df: pl.DataFrame) -> list[str]:
+    """All columns except the time axis, in file order."""
+    tcol = time_column(df)
+    return [c for c in df.columns if c != tcol]

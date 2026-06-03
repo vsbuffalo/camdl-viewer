@@ -9,6 +9,8 @@ wheels/
 # Virtual environments
 .venv
 
-# camdl-viewer generated demo data
+# camdl-viewer generated demo data (regenerate with `make` in the example dir)
 output/
 data/
+examples/*/results/
+examples/*/data/

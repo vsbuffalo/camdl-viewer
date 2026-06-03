@@ -1,0 +1,15 @@
+# Theme primitives — the cohesive base. Structural de-Streamlit'ing (hiding
+# chrome, tree rows, cards) lives in camdl_viewer/theme.py CSS, layered on top.
+[theme]
+base = "light"
+primaryColor = "#3d5a80"            # slate-blue accent (selection / focus)
+backgroundColor = "#fbfaf7"         # warm paper
+secondaryBackgroundColor = "#efede6"  # sidebar
+textColor = "#1f1e1c"               # ink
+font = "sans serif"
+
+[client]
+toolbarMode = "minimal"             # drop the top-right deploy/toolbar
+
+[browser]
+gatherUsageStats = false

@@ -1,128 +1,96 @@
-"""Align replicate trajectories onto a common time axis and compute the
-prediction-interval bands used by the simulation-ensemble tab.
+"""Replicate alignment — turn a scenario's per-seed trajectories into one
+aligned ``ReplicateSet`` that the aggregators consume.
 
-Replicates may live on different time grids (epidemics that die out early stop
-sooner; ODE backends emit non-integer ``t``). We build a common axis and
-linearly interpolate each replicate onto it, marking values outside a
-replicate's own time range as NaN (no extrapolation). Quantiles are then taken
-with ``np.nanquantile(..., method="linear")`` so a single short replicate does
-not poison later time points. ``method="linear"`` matches camdl's
-``quantile_sorted`` (external-harness/src/summary.rs).
+Replicates can have ragged time grids: a stochastic epidemic dies out early, and
+the Gillespie / tau-leap backends emit non-integer ``t``. So we interpolate each
+replicate onto a shared (union) time axis and leave ``NaN`` outside its own
+range — NaN-aware downstream, so one short replicate can't poison the
+aggregate at later time points.
+
+Pure numpy: no Streamlit, no I/O. The page hands in already-loaded tables.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Sequence
 from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
-import polars as pl
 
-from .cas import RunRecord
-
-TrajLoader = Callable[[Path], pl.DataFrame]
+Series = tuple[np.ndarray, np.ndarray]  # (t, y) for one replicate
 
 
-@dataclass
-class EnsembleSeries:
-    time: np.ndarray  # common axis, shape (T,)
-    replicates: np.ndarray  # shape (R, T); NaN outside each replicate's range
-    seeds: list[int | None]  # length R, aligned to axis 0
+@dataclass(frozen=True)
+class ReplicateSet:
+    """One scenario's replicates of one stream, aligned to a common axis."""
+
+    label: str
+    color: str
+    time: np.ndarray              # (T,)
+    values: np.ndarray            # (R, T) — NaN where a replicate doesn't cover t
+    seeds: tuple[int, ...]        # (R,)
+
+    @property
+    def n(self) -> int:
+        return int(self.values.shape[0]) if self.values.ndim == 2 else 0
 
 
-@dataclass
-class PIBands:
-    time: np.ndarray  # (T,)
-    median: np.ndarray  # (T,) = q50
-    q025: np.ndarray
-    q25: np.ndarray
-    q75: np.ndarray
-    q975: np.ndarray
-    n_per_t: np.ndarray  # (T,) non-NaN replicate count per time
+def align_replicates(
+    series: Sequence[Series], *, mode: str = "union"
+) -> tuple[np.ndarray, np.ndarray]:
+    """Interpolate ragged ``(t, y)`` replicates onto a shared axis.
 
-
-def build_common_axis(times: list[np.ndarray], mode: str = "union") -> np.ndarray:
-    """Build a shared time axis from per-replicate time arrays.
-
-    ``union`` (default): sorted unique of all times. ``intersection``: the
-    overlap ``[max(min_i), min(max_i)]`` restricted to union points inside it.
+    ``mode="union"`` spans every replicate's time (NaN outside each one's
+    range); ``"intersection"`` restricts to the overlap all replicates cover.
+    Returns ``(time[T], values[R, T])``.
     """
-    times = [t for t in times if t.size > 0]
-    if not times:
-        return np.empty(0, dtype=float)
-    union = np.unique(np.concatenate(times))
+    clean: list[Series] = [
+        (np.asarray(t, dtype=float), np.asarray(y, dtype=float))
+        for t, y in series
+        if len(t) > 0
+    ]
+    if not clean:
+        return np.empty(0), np.empty((0, 0))
+
+    axis = np.unique(np.concatenate([t for t, _ in clean]))
     if mode == "intersection":
-        lo = max(float(t[0]) for t in times)
-        hi = min(float(t[-1]) for t in times)
-        if hi < lo:
-            return np.empty(0, dtype=float)
-        return union[(union >= lo) & (union <= hi)]
-    return union
+        lo = max(t.min() for t, _ in clean)
+        hi = min(t.max() for t, _ in clean)
+        axis = axis[(axis >= lo) & (axis <= hi)]
+
+    values = np.full((len(clean), axis.size), np.nan)
+    for i, (t, y) in enumerate(clean):
+        covered = (axis >= t.min()) & (axis <= t.max())
+        if covered.any():
+            values[i, covered] = np.interp(axis[covered], t, y)
+    return axis, values
 
 
-def assemble_ensemble(
-    records: list[RunRecord],
-    traj_loader: TrajLoader,
-    stream: str,
-    axis_mode: str = "union",
-) -> EnsembleSeries:
-    """Load each record's ``stream`` column and stack onto a common time axis.
+def replicate_summary(rs: ReplicateSet) -> dict[str, float | int]:
+    """Across-replicate numeric summary of one scenario (NaN-aware).
 
-    Records lacking a ``traj_path`` or the requested ``stream`` are skipped.
+    Reports the median over replicates of the per-replicate peak height, the
+    time of that peak, and the final value — the headline numbers for comparing
+    scenarios beyond the picture.
     """
-    loaded: list[tuple[int | None, np.ndarray, np.ndarray]] = []
-    for rec in records:
-        if rec.traj_path is None:
-            continue
-        df = traj_loader(rec.traj_path)
-        if "t" not in df.columns or stream not in df.columns:
-            continue
-        t = df["t"].to_numpy().astype(float)
-        y = df[stream].to_numpy().astype(float)
-        order = np.argsort(t, kind="stable")
-        loaded.append((rec.seed, t[order], y[order]))
+    v = rs.values
+    if v.size == 0 or rs.n == 0:
+        return {"n": 0}
 
-    if not loaded:
-        empty = np.empty(0, dtype=float)
-        return EnsembleSeries(time=empty, replicates=np.empty((0, 0)), seeds=[])
-
-    axis = build_common_axis([t for _, t, _ in loaded], axis_mode)
-    rows = []
-    seeds: list[int | None] = []
-    for seed, t, y in loaded:
-        # Interpolate onto the common axis; NaN outside [t[0], t[-1]].
-        interp = np.interp(axis, t, y, left=np.nan, right=np.nan)
-        rows.append(interp)
-        seeds.append(seed)
-
-    replicates = np.vstack(rows) if rows else np.empty((0, axis.size))
-    return EnsembleSeries(time=axis, replicates=replicates, seeds=seeds)
-
-
-def compute_pi(
-    series: EnsembleSeries,
-    quantiles: tuple[float, ...] = (0.025, 0.25, 0.5, 0.75, 0.975),
-) -> PIBands:
-    """Per-time quantiles across replicates (NaN-aware, linear interpolation)."""
-    reps = series.replicates
-    time = series.time
-    if reps.size == 0 or reps.shape[0] == 0:
-        z = np.full(time.shape, np.nan)
-        return PIBands(time, z, z.copy(), z.copy(), z.copy(), z.copy(),
-                       np.zeros(time.shape, dtype=int))
-
-    n_per_t = np.sum(np.isfinite(reps), axis=0)
-    # nanquantile warns on all-NaN columns; those legitimately yield NaN.
-    with np.errstate(invalid="ignore"):
-        qs = np.nanquantile(reps, quantiles, axis=0, method="linear")
-    q025, q25, q50, q75, q975 = qs
-    return PIBands(
-        time=time,
-        median=q50,
-        q025=q025,
-        q25=q25,
-        q75=q75,
-        q975=q975,
-        n_per_t=n_per_t,
+    peaks = np.nanmax(v, axis=1)                                   # (R,)
+    peak_idx = np.argmax(np.where(np.isfinite(v), v, -np.inf), axis=1)
+    peak_t = rs.time[peak_idx]
+    finals = np.array(
+        [row[np.isfinite(row)][-1] if np.isfinite(row).any() else np.nan for row in v]
     )
+
+    def med(a: np.ndarray) -> float:
+        a = a[np.isfinite(a)]
+        return float(np.median(a)) if a.size else float("nan")
+
+    return {
+        "n": rs.n,
+        "peak_med": med(peaks),
+        "peak_t_med": med(peak_t),
+        "final_med": med(finals),
+    }
